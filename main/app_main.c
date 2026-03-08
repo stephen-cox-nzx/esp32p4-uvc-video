@@ -21,6 +21,7 @@
 #include "perf_monitor.h"
 #include "eth_init.h"
 #include "rtsp_server.h"
+#include "onvif_server.h"
 
 static const char *TAG = "app_main";
 
@@ -70,6 +71,12 @@ void app_main(void)
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "RTSP server start failed: %s", esp_err_to_name(ret));
         }
+
+        /* Phase 6b: Start ONVIF Profile T service (WS-Discovery + HTTP/SOAP) */
+        ret = onvif_server_start();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "ONVIF server start failed: %s", esp_err_to_name(ret));
+        }
     }
 
     /* Phase 7: Start performance monitor (CPU, memory, streaming stats) */
@@ -77,4 +84,6 @@ void app_main(void)
 
     ESP_LOGI(TAG, "UVC device ready - connect USB to host");
     ESP_LOGI(TAG, "RTSP stream: rtsp://<device-ip>:554/stream");
+    ESP_LOGI(TAG, "ONVIF device: http://<device-ip>:%d/onvif/device_service",
+             CONFIG_ONVIF_HTTP_PORT);
 }

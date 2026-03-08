@@ -9,6 +9,7 @@ idf_component_register(
         "eth_init.c"
         "rtsp_server.c"
         "rtp_sender.c"
+        "onvif_server.c"
     INCLUDE_DIRS
         "."
     PRIV_REQUIRES
@@ -21,4 +22,6 @@ idf_component_register(
         esp_eth
         esp_netif
         esp_event
+        esp_http_server
+        espressif__expat
 )

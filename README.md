@@ -56,6 +56,37 @@ H.264 video over standard RTSP (RFC 2326) and RTP (RFC 6184):
 
 The RTSP server operates in **self-capture mode** -- it independently drives the camera and H.264 encoder when USB is idle. When a USB host starts UVC streaming, the RTSP server yields the camera and pauses until USB streaming stops.
 
+### ONVIF Profile T
+
+The device implements [ONVIF Profile T](https://www.onvif.org/profiles/profile-t/) for standardised IP camera integration with VMS systems and ONVIF-compliant clients:
+
+| Service | URL | Protocol |
+|---------|-----|----------|
+| WS-Discovery | UDP 239.255.255.250:3702 | Multicast |
+| Device service | `http://<ip>:80/onvif/device_service` | SOAP/HTTP |
+| Media2 service | `http://<ip>:80/onvif/media_service` | SOAP/HTTP |
+
+**Supported ONVIF operations:**
+
+*Device service:*
+- `GetSystemDateAndTime` — device clock
+- `GetDeviceInformation` — model, firmware, serial number
+- `GetCapabilities` — service URLs and feature flags
+- `GetServices` — service directory (Device + Media2)
+- `GetServiceCapabilities` — per-service capability flags
+
+*Media2 service (Profile T):*
+- `GetProfiles` — single H.264 1080p@30fps profile
+- `GetStreamUri` — returns `rtsp://<ip>:554/stream`
+- `GetVideoSources` — 1920×1080 video source
+- `GetVideoSourceConfigurations` — source binding
+- `GetVideoEncoderConfigurations` — H.264 Baseline encoder config
+- `GetVideoEncoderConfigurationOptions` — supported resolutions/bitrates
+
+**WS-Discovery:** The device sends a `Hello` message on startup and responds to `Probe` messages so that ONVIF clients (e.g. ONVIF Device Manager, Milestone XProtect, Axis Camera Station) discover the camera automatically without manual IP entry.
+
+**Authentication:** None required — suitable for trusted LAN deployments. Add WS-Security credentials in a custom build if needed.
+
 ### ISP Pipeline
 
 The on-chip ISP processes RAW10 Bayer data with:
@@ -136,7 +167,7 @@ Default white balance profile applied at startup. Changeable at runtime via the 
 
 USB H.264 defaults favor low bitrate since USB HS bulk bandwidth is shared with other formats.
 
-### Ethernet / RTSP
+### Ethernet / RTSP / ONVIF
 
 | Option | Default | Range |
 |--------|---------|-------|
@@ -145,6 +176,7 @@ USB H.264 defaults favor low bitrate since USB HS bulk bandwidth is shared with 
 | Netmask | 255.255.255.0 | -- |
 | Gateway | 192.168.0.1 | -- |
 | RTSP port | 554 | 1-65535 |
+| ONVIF HTTP port | 80 | 1-65535 |
 | RTSP H.264 bitrate | 8,000,000 bps | 500K-20M |
 | RTSP H.264 I-period (GOP) | 10 | 1-120 |
 | RTSP H.264 min QP | 20 | 0-51 |
@@ -193,6 +225,33 @@ ffprobe rtsp://<device-ip>:554/stream
 ffmpeg -i rtsp://<device-ip>:554/stream -c copy output.mp4
 ```
 
+### ONVIF Profile T
+
+ONVIF clients (e.g. ONVIF Device Manager, VLC ONVIF plugin, VMS systems) can discover the camera via WS-Discovery or by entering the device service URL directly:
+
+- **Device service URL:** `http://<device-ip>/onvif/device_service`
+- **Stream URI** (returned by `GetStreamUri`): `rtsp://<device-ip>:554/stream`
+
+```bash
+# Verify device service with curl (GetSystemDateAndTime)
+curl -s -X POST http://192.168.0.200/onvif/device_service \
+  -H 'Content-Type: application/soap+xml' \
+  -d '<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
+  <s:Body><tds:GetSystemDateAndTime/></s:Body>
+</s:Envelope>'
+
+# Verify stream URI with curl (GetStreamUri)
+curl -s -X POST http://192.168.0.200/onvif/media_service \
+  -H 'Content-Type: application/soap+xml' \
+  -d '<?xml version="1.0"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:tr2="http://www.onvif.org/ver20/media/wsdl">
+  <s:Body><tr2:GetStreamUri/></s:Body>
+</s:Envelope>'
+```
+
 ### Simultaneous USB + Ethernet
 
 Both interfaces can be active, but only one drives the camera at a time:
@@ -218,6 +277,11 @@ OV5647 ──MIPI CSI──> ISP (RAW10→UYVY) ──> V4L2 Capture (1920x1080)
                                 RTSP/RTP      UVC USB (H.264 + MJPEG + UYVY)
                               (Ethernet)     (High-Speed bulk)
                               port 554
+                                    │
+                               ONVIF Profile T
+                             WS-Discovery :3702
+                             HTTP/SOAP    :80
+                           (GetStreamUri → rtsp://...)
 ```
 
 ### Source Files
@@ -232,6 +296,7 @@ OV5647 ──MIPI CSI──> ISP (RAW10→UYVY) ──> V4L2 Capture (1920x1080)
 | `eth_init.c` | Ethernet PHY init, static IP / DHCP |
 | `rtsp_server.c` | RTSP protocol handler, self-capture loop |
 | `rtp_sender.c` | RTP H.264 packetization (NAL/FU-A) |
+| `onvif_server.c` | ONVIF Profile T: WS-Discovery + Device/Media2 SOAP services |
 | `perf_monitor.c` | CPU usage, memory, streaming stats |
 | `board_olimex_p4.h` | Board pin definitions |
 
