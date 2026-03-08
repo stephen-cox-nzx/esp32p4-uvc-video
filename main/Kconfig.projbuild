@@ -113,6 +113,15 @@ menu "UVC Webcam Configuration"
             help
                 TCP port for the RTSP server.
 
+        config ONVIF_HTTP_PORT
+            int "ONVIF HTTP server port"
+            default 80
+            range 1 65535
+            help
+                TCP port for the ONVIF Profile T HTTP/SOAP server.
+                Standard ONVIF port is 80. Change if another service
+                already occupies port 80.
+
         config RTSP_H264_BITRATE
             int "RTSP H.264 bitrate (bps)"
             default 8000000
