@@ -22,4 +22,6 @@ idf_component_register(
         esp_eth
         esp_netif
         esp_event
+        esp_http_server
+        espressif__expat
 )

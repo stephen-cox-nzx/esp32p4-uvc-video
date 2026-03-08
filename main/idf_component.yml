@@ -12,3 +12,5 @@ dependencies:
   usb_device_uvc:
     version: "*"
     override_path: "../components/usb_device_uvc"
+  espressif/expat:
+    version: ">=2.7.4"

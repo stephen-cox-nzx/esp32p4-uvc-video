@@ -13,6 +13,9 @@
  *     without manual IP entry.
  *
  *   ONVIF HTTP/SOAP server (TCP port CONFIG_ONVIF_HTTP_PORT, default 80)
+ *     Uses the esp_http_server component for connection management and
+ *     the expat XML library for robust SOAP method extraction.
+ *
  *     Device service  : /onvif/device_service
  *     Media2 service  : /onvif/media_service
  *
@@ -21,8 +24,6 @@
  *     H.264 feed encoded by the hardware H.264 block.
  *
  * Authentication is deliberately omitted — suitable for trusted LAN use.
- * The implementation uses a single-request-per-connection HTTP model and
- * allocates all large buffers from PSRAM (MALLOC_CAP_SPIRAM).
  */
 
 #include "onvif_server.h"
@@ -31,6 +32,8 @@
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "esp_heap_caps.h"
+#include "esp_http_server.h"
+#include "expat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
@@ -48,15 +51,16 @@ static const char *TAG = "onvif";
 #define ONVIF_DISC_PORT         3702
 #define ONVIF_MCAST_ADDR        "239.255.255.250"
 
-/* Task parameters */
+/* Task / server parameters */
 #define ONVIF_HTTP_TASK_STACK   12288
 #define ONVIF_DISC_TASK_STACK   4096
 #define ONVIF_TASK_PRIO         5
 
-/* Buffer sizes (PSRAM-allocated) */
-#define ONVIF_HTTP_REQ_SIZE     4096   /* Max SOAP request */
-#define ONVIF_RESP_BUF_SIZE     8192   /* Max SOAP response (envelope + body) */
-#define ONVIF_DISC_BUF_SIZE     2048   /* WS-Discovery message */
+/* Maximum SOAP request body accepted from clients */
+#define ONVIF_HTTP_REQ_SIZE     4096
+
+/* WS-Discovery UDP message buffer */
+#define ONVIF_DISC_BUF_SIZE     2048
 
 /* SOAP envelope namespaces injected into every response */
 #define SOAP_NS \
@@ -106,8 +110,8 @@ static bool wait_for_ip(int timeout_ms)
 }
 
 /*
- * Derive a stable UUID (v4-ish) and serial number from the Ethernet MAC.
- * UUID format: xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx
+ * Derive a stable UUID and serial number from the Ethernet MAC.
+ * Not a true random UUIDv4 — MAC bytes fill all fields for stability.
  */
 static void gen_device_identity(void)
 {
@@ -118,7 +122,6 @@ static void gen_device_identity(void)
      * Build a deterministic UUID derived from the Ethernet MAC address.
      * Format: xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx
      * Version nibble set to 4, variant nibble set to 8..b.
-     * Not a true random UUIDv4 — MAC bytes fill all fields for stability.
      */
     snprintf(s_device_uuid, sizeof(s_device_uuid),
              "urn:uuid:%02x%02x%02x%02x-%02x%02x-4%01x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
@@ -133,223 +136,160 @@ static void gen_device_identity(void)
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-/* ---- HTTP / SOAP helpers ------------------------------------------------ */
+/* ---- Expat XML parsing -------------------------------------------------- */
 
 /*
- * Read a complete HTTP request into buf:
- *   - reads until the header terminator "\r\n\r\n"
- *   - then reads the remaining body bytes from Content-Length
- * Returns total bytes read, -1 on error / timeout.
+ * Context used by the expat start-element callback to locate the
+ * first child element of the SOAP <s:Body>, which is the method name.
  */
-static int read_http_request(int fd, char *buf, int bufsize)
+typedef struct {
+    char       method[64]; /* Local name of the first Body child */
+    bool       in_body;    /* True once we have entered <s:Body> */
+    bool       found;      /* True once method[] has been filled */
+    XML_Parser parser;     /* Back-reference for early stop */
+} soap_parse_ctx_t;
+
+static void XMLCALL soap_start_element(void *user_data, const XML_Char *name,
+                                        const XML_Char **attrs)
 {
-    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    int total = 0;
-    int content_length = 0;
-    int header_end = -1;
-
-    while (total < bufsize - 1) {
-        int n = recv(fd, buf + total, bufsize - total - 1, 0);
-        if (n <= 0) {
-            if (total == 0) {
-                return -1;
-            }
-            break;
-        }
-        total += n;
-        buf[total] = '\0';
-
-        /* Locate end-of-headers on the first pass */
-        if (header_end < 0) {
-            char *p = strstr(buf, "\r\n\r\n");
-            if (p) {
-                header_end = (int)(p - buf) + 4;
-                /* Extract Content-Length */
-                const char *cl = strstr(buf, "Content-Length:");
-                if (!cl) {
-                    cl = strstr(buf, "content-length:");
-                }
-                if (cl) {
-                    content_length = atoi(cl + 15);
-                }
-            }
-        }
-
-        /* Stop once we have the full body */
-        if (header_end > 0) {
-            int body_received = total - header_end;
-            if (content_length <= 0 || body_received >= content_length) {
-                break;
-            }
-        }
+    soap_parse_ctx_t *ctx = (soap_parse_ctx_t *)user_data;
+    if (ctx->found) {
+        return;
     }
 
-    return total;
+    /*
+     * Expat passes element names as "prefix:local" with XML_ParserCreate.
+     * Strip the namespace prefix to get the local name.
+     */
+    const char *local = strrchr(name, ':');
+    local = local ? local + 1 : name;
+
+    if (!ctx->in_body) {
+        if (strcmp(local, "Body") == 0) {
+            ctx->in_body = true;
+        }
+        return;
+    }
+
+    /* First child element of Body is the SOAP method */
+    snprintf(ctx->method, sizeof(ctx->method), "%s", local);
+    ctx->found = true;
+
+    /* Stop the parse early — we have everything we need */
+    XML_StopParser(ctx->parser, XML_FALSE);
 }
 
 /*
- * Send an HTTP 200 OK response whose body is a complete SOAP envelope
- * wrapping soap_body.  Allocates the response buffer from PSRAM.
+ * Parse a SOAP envelope with expat and write the SOAP method name (the local
+ * name of the first child element of <s:Body>) into method_out.
+ *
+ * Returns true on success, false if parsing fails or no Body child is found.
+ * Thread-safe: all state is on the caller's stack.
  */
-static void send_soap_ok(int fd, const char *soap_body)
+static bool extract_soap_method(const char *xml_body, int xml_len,
+                                 char *method_out, int method_out_size)
+{
+    soap_parse_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
+    XML_Parser parser = XML_ParserCreate(NULL);
+    if (!parser) {
+        ESP_LOGE(TAG, "XML_ParserCreate failed");
+        return false;
+    }
+
+    ctx.parser = parser;
+    XML_SetUserData(parser, &ctx);
+    XML_SetStartElementHandler(parser, soap_start_element);
+
+    /*
+     * XML_Parse returns XML_STATUS_ERROR when XML_StopParser is called
+     * from within a handler (expected behaviour for early stop).
+     * Only log a warning for genuine parse errors.
+     */
+    XML_Status status = XML_Parse(parser, xml_body, xml_len, XML_TRUE);
+    if (status == XML_STATUS_ERROR && !ctx.found) {
+        ESP_LOGW(TAG, "XML parse error at line %lu: %s",
+                 (unsigned long)XML_GetCurrentLineNumber(parser),
+                 XML_ErrorString(XML_GetErrorCode(parser)));
+    }
+
+    XML_ParserFree(parser);
+
+    if (!ctx.found) {
+        return false;
+    }
+    snprintf(method_out, method_out_size, "%s", ctx.method);
+    return true;
+}
+
+/* ---- HTTP / SOAP helpers ------------------------------------------------ */
+
+/*
+ * Read the complete SOAP request body from an httpd_req_t into a
+ * PSRAM-allocated buffer.  The caller must heap_caps_free(*body_out).
+ *
+ * Returns ESP_OK on success.  On error the buffer is freed internally
+ * and *body_out is set to NULL.
+ */
+static esp_err_t read_soap_body(httpd_req_t *req, char **body_out, int *len_out)
+{
+    int content_len = req->content_len;
+    if (content_len <= 0 || content_len > ONVIF_HTTP_REQ_SIZE) {
+        ESP_LOGW(TAG, "Bad Content-Length: %d", content_len);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char *body = heap_caps_malloc(content_len + 1, MALLOC_CAP_SPIRAM);
+    if (!body) {
+        ESP_LOGE(TAG, "read_soap_body: PSRAM alloc failed (%d bytes)", content_len);
+        return ESP_ERR_NO_MEM;
+    }
+
+    int received = 0;
+    while (received < content_len) {
+        int r = httpd_req_recv(req, body + received, content_len - received);
+        if (r <= 0) {
+            if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue; /* Retry on transient timeout */
+            }
+            ESP_LOGW(TAG, "httpd_req_recv failed: %d", r);
+            heap_caps_free(body);
+            return ESP_FAIL;
+        }
+        received += r;
+    }
+    body[received] = '\0';
+
+    *body_out = body;
+    *len_out  = received;
+    return ESP_OK;
+}
+
+/*
+ * Send a SOAP 200 OK response whose body is a complete SOAP envelope
+ * wrapping soap_body.  Uses chunked transfer encoding via esp_http_server
+ * to avoid a large contiguous allocation.
+ */
+static esp_err_t send_soap_ok(httpd_req_t *req, const char *soap_body)
 {
     static const char SOAP_OPEN[] =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
         "<s:Envelope" SOAP_NS "><s:Body>";
     static const char SOAP_CLOSE[] = "</s:Body></s:Envelope>";
 
-    int body_len = (int)(sizeof(SOAP_OPEN) - 1 + strlen(soap_body)
-                         + sizeof(SOAP_CLOSE) - 1);
-
-    char *resp = heap_caps_malloc(ONVIF_RESP_BUF_SIZE, MALLOC_CAP_SPIRAM);
-    if (!resp) {
-        ESP_LOGE(TAG, "send_soap_ok: PSRAM alloc failed");
-        return;
-    }
-
-    /* HTTP header */
-    int n = snprintf(resp, ONVIF_RESP_BUF_SIZE,
-                     "HTTP/1.1 200 OK\r\n"
-                     "Content-Type: application/soap+xml; charset=utf-8\r\n"
-                     "Content-Length: %d\r\n"
-                     "Connection: close\r\n"
-                     "\r\n",
-                     body_len);
-
-    /* SOAP envelope */
-    int remaining = ONVIF_RESP_BUF_SIZE - n;
-    if (remaining > body_len + 1) {
-        memcpy(resp + n, SOAP_OPEN, sizeof(SOAP_OPEN) - 1);
-        n += (int)(sizeof(SOAP_OPEN) - 1);
-        memcpy(resp + n, soap_body, strlen(soap_body));
-        n += (int)strlen(soap_body);
-        memcpy(resp + n, SOAP_CLOSE, sizeof(SOAP_CLOSE) - 1);
-        n += (int)(sizeof(SOAP_CLOSE) - 1);
-    } else {
-        ESP_LOGE(TAG, "send_soap_ok: response too large (%d bytes)", body_len);
-        heap_caps_free(resp);
-        return;
-    }
-
-    send(fd, resp, n, 0);
-    heap_caps_free(resp);
-}
-
-/* Send a minimal HTTP error response. */
-static void send_http_error(int fd, int code, const char *reason)
-{
-    char resp[128];
-    snprintf(resp, sizeof(resp),
-             "HTTP/1.1 %d %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-             code, reason);
-    send(fd, resp, strlen(resp), 0);
-}
-
-/*
- * Copy the last path component from a URL-like string into dst[63].
- * Stops at '"', '\'', '\r', '\n', ';', or end-of-string.
- * Returns true if at least one character was copied.
- */
-static bool last_path_component(const char *url, char *dst)
-{
-    const char *slash = strrchr(url, '/');
-    if (!slash) {
-        return false;
-    }
-    const char *start = slash + 1;
-    int i = 0;
-    while (start[i] && start[i] != '"' && start[i] != '\'' &&
-           start[i] != '\r' && start[i] != '\n' &&
-           start[i] != ';'  && i < 63) {
-        dst[i] = start[i];
-        i++;
-    }
-    dst[i] = '\0';
-    return i > 0;
-}
-
-/*
- * Extract the SOAP method name from an HTTP/SOAP request buffer.
- *
- * Tries (in order):
- *   1. HTTP SOAPAction header value (last path component)
- *   2. action parameter in Content-Type (SOAP 1.2)
- *   3. First element name inside <s:Body> / <soap:Body>
- *
- * Returns a pointer to a static buffer, or NULL if nothing found.
- */
-static const char *extract_soap_method(const char *req)
-{
-    static char method[64];
-
-    /* 1. SOAPAction header */
-    const char *sa = strstr(req, "SOAPAction:");
-    if (!sa) {
-        sa = strstr(req, "soapaction:");
-    }
-    if (sa) {
-        sa += 11; /* skip "SOAPAction:" */
-        while (*sa == ' ' || *sa == '\t' || *sa == '"') {
-            sa++;
-        }
-        if (last_path_component(sa, method)) {
-            return method;
-        }
-    }
-
-    /* 2. action= parameter in Content-Type (SOAP 1.2 style) */
-    const char *ct = strstr(req, "action=");
-    if (ct) {
-        ct += 7;
-        while (*ct == '"' || *ct == ' ') {
-            ct++;
-        }
-        if (last_path_component(ct, method)) {
-            return method;
-        }
-    }
-
-    /* 3. First element in <s:Body> (namespace-aware) */
-    const char *body = strstr(req, ":Body>");
-    if (body) {
-        const char *p = body + 6; /* skip ":Body>" */
-        while (*p == ' ' || *p == '\r' || *p == '\n' || *p == '\t') {
-            p++;
-        }
-        if (*p == '<') {
-            p++; /* skip '<' */
-            /* Skip namespace prefix (everything up to and including ':') */
-            const char *colon = NULL;
-            const char *start = p;
-            const char *scan = p;
-            while (*scan && *scan != ' ' && *scan != '>' && *scan != '/') {
-                if (*scan == ':') {
-                    colon = scan;
-                }
-                scan++;
-            }
-            if (colon) {
-                start = colon + 1;
-            }
-            int len = (int)(scan - start);
-            if (len > 0 && len < 63) {
-                memcpy(method, start, len);
-                method[len] = '\0';
-                return method;
-            }
-        }
-    }
-
-    return NULL;
+    httpd_resp_set_type(req, "application/soap+xml; charset=utf-8");
+    httpd_resp_send_chunk(req, SOAP_OPEN,  HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, soap_body,  HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, SOAP_CLOSE, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send_chunk(req, NULL, 0); /* terminate chunked response */
 }
 
 /* ---- SOAP response builders --------------------------------------------- */
 
-static void handle_GetSystemDateAndTime(int fd)
+static esp_err_t handle_GetSystemDateAndTime(httpd_req_t *req)
 {
-    send_soap_ok(fd,
+    return send_soap_ok(req,
         "<tds:GetSystemDateAndTimeResponse>"
           "<tds:SystemDateAndTime>"
             "<tt:DateTimeType>Manual</tt:DateTimeType>"
@@ -371,7 +311,7 @@ static void handle_GetSystemDateAndTime(int fd)
         "</tds:GetSystemDateAndTimeResponse>");
 }
 
-static void handle_GetDeviceInformation(int fd)
+static esp_err_t handle_GetDeviceInformation(httpd_req_t *req)
 {
     char body[512];
     snprintf(body, sizeof(body),
@@ -383,10 +323,10 @@ static void handle_GetDeviceInformation(int fd)
           "<tds:HardwareId>ESP32-P4</tds:HardwareId>"
         "</tds:GetDeviceInformationResponse>",
         s_serial_number);
-    send_soap_ok(fd, body);
+    return send_soap_ok(req, body);
 }
 
-static void handle_GetCapabilities(int fd)
+static esp_err_t handle_GetCapabilities(httpd_req_t *req)
 {
     char local_ip[32];
     get_local_ip(local_ip, sizeof(local_ip));
@@ -422,10 +362,10 @@ static void handle_GetCapabilities(int fd)
         "</tds:GetCapabilitiesResponse>",
         local_ip, ONVIF_HTTP_PORT,
         local_ip, ONVIF_HTTP_PORT);
-    send_soap_ok(fd, body);
+    return send_soap_ok(req, body);
 }
 
-static void handle_GetServices(int fd)
+static esp_err_t handle_GetServices(httpd_req_t *req)
 {
     char local_ip[32];
     get_local_ip(local_ip, sizeof(local_ip));
@@ -452,13 +392,13 @@ static void handle_GetServices(int fd)
         "</tds:GetServicesResponse>",
         local_ip, ONVIF_HTTP_PORT,
         local_ip, ONVIF_HTTP_PORT);
-    send_soap_ok(fd, body);
+    return send_soap_ok(req, body);
 }
 
 /* Device service capabilities */
-static void handle_GetServiceCapabilities_device(int fd)
+static esp_err_t handle_GetServiceCapabilities_device(httpd_req_t *req)
 {
-    send_soap_ok(fd,
+    return send_soap_ok(req,
         "<tds:GetServiceCapabilitiesResponse>"
           "<tds:Capabilities>"
             "<tds:Network IPFilter=\"false\" ZeroConfiguration=\"false\""
@@ -482,9 +422,9 @@ static void handle_GetServiceCapabilities_device(int fd)
 }
 
 /* Media2 service capabilities */
-static void handle_GetServiceCapabilities_media(int fd)
+static esp_err_t handle_GetServiceCapabilities_media(httpd_req_t *req)
 {
-    send_soap_ok(fd,
+    return send_soap_ok(req,
         "<tr2:GetServiceCapabilitiesResponse>"
           "<tr2:Capabilities>"
             "<tr2:ProfileCapabilities MaximumNumberOfProfiles=\"1\"/>"
@@ -496,7 +436,7 @@ static void handle_GetServiceCapabilities_media(int fd)
         "</tr2:GetServiceCapabilitiesResponse>");
 }
 
-static void handle_GetProfiles(int fd)
+static esp_err_t handle_GetProfiles(httpd_req_t *req)
 {
     char body[2048];
     snprintf(body, sizeof(body),
@@ -544,10 +484,10 @@ static void handle_GetProfiles(int fd)
         "</tr2:GetProfilesResponse>",
         CONFIG_RTSP_H264_BITRATE / 1000,  /* kbps */
         CONFIG_RTSP_H264_I_PERIOD);
-    send_soap_ok(fd, body);
+    return send_soap_ok(req, body);
 }
 
-static void handle_GetStreamUri(int fd)
+static esp_err_t handle_GetStreamUri(httpd_req_t *req)
 {
     char local_ip[32];
     get_local_ip(local_ip, sizeof(local_ip));
@@ -558,12 +498,12 @@ static void handle_GetStreamUri(int fd)
           "<tr2:Uri>rtsp://%s:%d/stream</tr2:Uri>"
         "</tr2:GetStreamUriResponse>",
         local_ip, CONFIG_ETH_RTSP_PORT);
-    send_soap_ok(fd, body);
+    return send_soap_ok(req, body);
 }
 
-static void handle_GetVideoSources(int fd)
+static esp_err_t handle_GetVideoSources(httpd_req_t *req)
 {
-    send_soap_ok(fd,
+    return send_soap_ok(req,
         "<tr2:GetVideoSourcesResponse>"
           "<tr2:VideoSources token=\"video_source\">"
             "<tt:Framerate>30</tt:Framerate>"
@@ -576,9 +516,9 @@ static void handle_GetVideoSources(int fd)
         "</tr2:GetVideoSourcesResponse>");
 }
 
-static void handle_GetVideoSourceConfigurations(int fd)
+static esp_err_t handle_GetVideoSourceConfigurations(httpd_req_t *req)
 {
-    send_soap_ok(fd,
+    return send_soap_ok(req,
         "<tr2:GetVideoSourceConfigurationsResponse>"
           "<tr2:Configurations token=\"vs_config\">"
             "<tt:Name>VideoSourceConfig</tt:Name>"
@@ -589,7 +529,7 @@ static void handle_GetVideoSourceConfigurations(int fd)
         "</tr2:GetVideoSourceConfigurationsResponse>");
 }
 
-static void handle_GetVideoEncoderConfigurations(int fd)
+static esp_err_t handle_GetVideoEncoderConfigurations(httpd_req_t *req)
 {
     char body[1024];
     snprintf(body, sizeof(body),
@@ -616,12 +556,12 @@ static void handle_GetVideoEncoderConfigurations(int fd)
         "</tr2:GetVideoEncoderConfigurationsResponse>",
         CONFIG_RTSP_H264_BITRATE / 1000,
         CONFIG_RTSP_H264_I_PERIOD);
-    send_soap_ok(fd, body);
+    return send_soap_ok(req, body);
 }
 
-static void handle_GetVideoEncoderConfigurationOptions(int fd)
+static esp_err_t handle_GetVideoEncoderConfigurationOptions(httpd_req_t *req)
 {
-    send_soap_ok(fd,
+    return send_soap_ok(req,
         "<tr2:GetVideoEncoderConfigurationOptionsResponse>"
           "<tr2:Options token=\"ve_config\">"
             "<tr2:VideoEncoderOptionsExtension>"
@@ -658,7 +598,7 @@ static void handle_GetVideoEncoderConfigurationOptions(int fd)
 }
 
 /* SOAP fault for any unrecognised action */
-static void send_soap_fault(int fd, const char *action)
+static esp_err_t send_soap_fault(httpd_req_t *req, const char *action)
 {
     char body[384];
     snprintf(body, sizeof(body),
@@ -676,127 +616,97 @@ static void send_soap_fault(int fd, const char *action)
           "</s:Reason>"
         "</s:Fault>",
         action ? action : "unknown");
-    send_soap_ok(fd, body);
+    return send_soap_ok(req, body);
 }
 
-/* ---- HTTP request dispatcher -------------------------------------------- */
+/* ---- SOAP method dispatcher --------------------------------------------- */
 
-static void handle_onvif_client(int fd)
+/*
+ * Route a parsed SOAP method name to the appropriate handler.
+ * is_media_service is true when the request arrived on /onvif/media_service.
+ */
+static esp_err_t dispatch_soap_method(httpd_req_t *req, const char *method,
+                                       bool is_media_service)
 {
-    char *req = heap_caps_malloc(ONVIF_HTTP_REQ_SIZE, MALLOC_CAP_SPIRAM);
-    if (!req) {
-        send_http_error(fd, 500, "Internal Server Error");
-        return;
-    }
-
-    int n = read_http_request(fd, req, ONVIF_HTTP_REQ_SIZE);
-    if (n <= 0) {
-        heap_caps_free(req);
-        return;
-    }
-
-    /* Only handle POST */
-    if (strncmp(req, "POST", 4) != 0) {
-        send_http_error(fd, 405, "Method Not Allowed");
-        heap_caps_free(req);
-        return;
-    }
-
-    const char *method = extract_soap_method(req);
-    if (!method) {
-        send_http_error(fd, 400, "Bad Request");
-        heap_caps_free(req);
-        return;
-    }
-
-    ESP_LOGD(TAG, "SOAP method: %s", method);
-
-    /* Route to handler.  GetServiceCapabilities is path-dependent. */
     if (strcmp(method, "GetSystemDateAndTime") == 0) {
-        handle_GetSystemDateAndTime(fd);
-    } else if (strcmp(method, "GetDeviceInformation") == 0) {
-        handle_GetDeviceInformation(fd);
-    } else if (strcmp(method, "GetCapabilities") == 0) {
-        handle_GetCapabilities(fd);
-    } else if (strcmp(method, "GetServices") == 0) {
-        handle_GetServices(fd);
-    } else if (strcmp(method, "GetServiceCapabilities") == 0) {
-        if (strstr(req, "/onvif/media") != NULL) {
-            handle_GetServiceCapabilities_media(fd);
-        } else {
-            handle_GetServiceCapabilities_device(fd);
-        }
-    } else if (strcmp(method, "GetProfiles") == 0) {
-        handle_GetProfiles(fd);
-    } else if (strcmp(method, "GetStreamUri") == 0) {
-        handle_GetStreamUri(fd);
-    } else if (strcmp(method, "GetVideoSources") == 0) {
-        handle_GetVideoSources(fd);
-    } else if (strcmp(method, "GetVideoSourceConfigurations") == 0) {
-        handle_GetVideoSourceConfigurations(fd);
-    } else if (strcmp(method, "GetVideoEncoderConfigurations") == 0) {
-        handle_GetVideoEncoderConfigurations(fd);
-    } else if (strcmp(method, "GetVideoEncoderConfigurationOptions") == 0) {
-        handle_GetVideoEncoderConfigurationOptions(fd);
-    } else {
-        ESP_LOGW(TAG, "Unhandled SOAP method: %s", method);
-        send_soap_fault(fd, method);
+        return handle_GetSystemDateAndTime(req);
+    }
+    if (strcmp(method, "GetDeviceInformation") == 0) {
+        return handle_GetDeviceInformation(req);
+    }
+    if (strcmp(method, "GetCapabilities") == 0) {
+        return handle_GetCapabilities(req);
+    }
+    if (strcmp(method, "GetServices") == 0) {
+        return handle_GetServices(req);
+    }
+    if (strcmp(method, "GetServiceCapabilities") == 0) {
+        return is_media_service
+               ? handle_GetServiceCapabilities_media(req)
+               : handle_GetServiceCapabilities_device(req);
+    }
+    if (strcmp(method, "GetProfiles") == 0) {
+        return handle_GetProfiles(req);
+    }
+    if (strcmp(method, "GetStreamUri") == 0) {
+        return handle_GetStreamUri(req);
+    }
+    if (strcmp(method, "GetVideoSources") == 0) {
+        return handle_GetVideoSources(req);
+    }
+    if (strcmp(method, "GetVideoSourceConfigurations") == 0) {
+        return handle_GetVideoSourceConfigurations(req);
+    }
+    if (strcmp(method, "GetVideoEncoderConfigurations") == 0) {
+        return handle_GetVideoEncoderConfigurations(req);
+    }
+    if (strcmp(method, "GetVideoEncoderConfigurationOptions") == 0) {
+        return handle_GetVideoEncoderConfigurationOptions(req);
     }
 
-    heap_caps_free(req);
+    ESP_LOGW(TAG, "Unhandled SOAP method: %s", method);
+    return send_soap_fault(req, method);
 }
 
-/* ---- ONVIF HTTP/SOAP server task ---------------------------------------- */
+/* ---- esp_http_server URI handlers --------------------------------------- */
 
-static void http_server_task(void *arg)
+/*
+ * Common handler body: read SOAP request, extract method with expat, dispatch.
+ */
+static esp_err_t onvif_post_handler(httpd_req_t *req, bool is_media_service)
 {
-    if (!wait_for_ip(30000)) {
-        ESP_LOGW(TAG, "ONVIF HTTP: no IP in 30 s, server may be unreachable");
+    char *body = NULL;
+    int   body_len = 0;
+
+    esp_err_t err = read_soap_body(req, &body, &body_len);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Cannot read SOAP body");
+        return err;
     }
 
-    int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listen_fd < 0) {
-        ESP_LOGE(TAG, "HTTP socket create failed: errno %d", errno);
-        vTaskDelete(NULL);
-        return;
+    char soap_method[64];
+    if (!extract_soap_method(body, body_len, soap_method, sizeof(soap_method))) {
+        heap_caps_free(body);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                            "Cannot parse SOAP method");
+        return ESP_FAIL;
     }
+    heap_caps_free(body);
 
-    int opt = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    ESP_LOGD(TAG, "%s method: %s",
+             is_media_service ? "Media2" : "Device", soap_method);
+    return dispatch_soap_method(req, soap_method, is_media_service);
+}
 
-    struct sockaddr_in addr = {
-        .sin_family      = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-        .sin_port        = htons(ONVIF_HTTP_PORT),
-    };
+static esp_err_t device_service_handler(httpd_req_t *req)
+{
+    return onvif_post_handler(req, false);
+}
 
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        ESP_LOGE(TAG, "HTTP bind failed: errno %d", errno);
-        close(listen_fd);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    if (listen(listen_fd, 4) < 0) {
-        ESP_LOGE(TAG, "HTTP listen failed: errno %d", errno);
-        close(listen_fd);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "ONVIF HTTP server listening on port %d", ONVIF_HTTP_PORT);
-
-    while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t addr_len = sizeof(client_addr);
-        int client_fd = accept(listen_fd, (struct sockaddr *)&client_addr, &addr_len);
-        if (client_fd < 0) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        handle_onvif_client(client_fd);
-        close(client_fd);
-    }
+static esp_err_t media_service_handler(httpd_req_t *req)
+{
+    return onvif_post_handler(req, true);
 }
 
 /* ---- WS-Discovery helpers ----------------------------------------------- */
@@ -1052,6 +962,7 @@ esp_err_t onvif_server_start(void)
     ESP_LOGI(TAG, "  Device UUID  : %s", s_device_uuid);
     ESP_LOGI(TAG, "  HTTP port    : %d", ONVIF_HTTP_PORT);
 
+    /* Start WS-Discovery task (waits for IP internally) */
     BaseType_t ret = xTaskCreate(discovery_task, "onvif_disc",
                                   ONVIF_DISC_TASK_STACK, NULL,
                                   ONVIF_TASK_PRIO, NULL);
@@ -1060,13 +971,35 @@ esp_err_t onvif_server_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ret = xTaskCreate(http_server_task, "onvif_http",
-                       ONVIF_HTTP_TASK_STACK, NULL,
-                       ONVIF_TASK_PRIO, NULL);
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "HTTP server task create failed");
-        return ESP_ERR_NO_MEM;
+    /* Start ONVIF HTTP/SOAP server via esp_http_server */
+    httpd_config_t http_config = HTTPD_DEFAULT_CONFIG();
+    http_config.server_port      = ONVIF_HTTP_PORT;
+    http_config.stack_size       = ONVIF_HTTP_TASK_STACK;
+    http_config.lru_purge_enable = true;
+
+    httpd_handle_t http_server = NULL;
+    esp_err_t err = httpd_start(&http_server, &http_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(err));
+        return err;
     }
+
+    static const httpd_uri_t device_uri = {
+        .uri     = "/onvif/device_service",
+        .method  = HTTP_POST,
+        .handler = device_service_handler,
+    };
+    httpd_register_uri_handler(http_server, &device_uri);
+
+    static const httpd_uri_t media_uri = {
+        .uri     = "/onvif/media_service",
+        .method  = HTTP_POST,
+        .handler = media_service_handler,
+    };
+    httpd_register_uri_handler(http_server, &media_uri);
+
+    ESP_LOGI(TAG, "ONVIF HTTP server started (port %d, esp_http_server + expat)",
+             ONVIF_HTTP_PORT);
 
     return ESP_OK;
 }
