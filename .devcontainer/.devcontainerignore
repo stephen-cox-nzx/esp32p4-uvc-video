@@ -1,0 +1,13 @@
+.git
+.gitignore
+.DS_Store
+.vscode
+__pycache__
+*.pyc
+build/
+sdkconfig.old
+.cache/
+.pytest_cache/
+*.swp
+*.swo
+*~

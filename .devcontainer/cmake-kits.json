@@ -1,0 +1,26 @@
+[
+    {
+        "name": "ESP-IDF (Ninja)",
+        "description": "ESP-IDF v5.5 with Ninja Multi-Config",
+        "toolchainFile": "${env:IDF_PATH}/tools/cmake/toolchain-esp32p4.cmake",
+        "preferredGenerators": [
+            "Ninja Multi-Config"
+        ],
+        "cacheVariables": {
+            "CMAKE_BUILD_TYPE": "Debug",
+            "IDF_TARGET": "esp32p4"
+        }
+    },
+    {
+        "name": "ESP-IDF (Unix Makefiles)",
+        "description": "ESP-IDF v5.5 with Unix Makefiles",
+        "toolchainFile": "${env:IDF_PATH}/tools/cmake/toolchain-esp32p4.cmake",
+        "preferredGenerators": [
+            "Unix Makefiles"
+        ],
+        "cacheVariables": {
+            "CMAKE_BUILD_TYPE": "Debug",
+            "IDF_TARGET": "esp32p4"
+        }
+    }
+]
