@@ -1,0 +1,77 @@
+{
+	"name": "ESP32-P4 UVC Camera (ESP-IDF v5.5)",
+	"image": "docker.io/espressif/idf:v5.5",
+	"features": {
+		"ghcr.io/devcontainers/features/common-utils:2": {
+			"installZsh": false
+		},
+		"ghcr.io/devcontainers/features/git:1": {},
+		//"ghcr.io/devcontainers/features/docker-in-docker:2": {}
+	},
+	"mounts": [
+		//	"source=/dev/ttyACM0,target=/dev/ttyACM0,type=bind,consistency=consistent"
+		"source=${localEnv:HOME}${localEnv:USERPROFILE}/.ssh,target=/home/node/.ssh,type=bind,consistency=cached"
+	],
+	"runArgs": [
+		"--device=/dev/bus/usb/001/002",
+		"--device=/dev/ttyACM0",
+		"--privileged",
+		"--group-add=keep-groups"
+	],
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"espressif.esp-idf-extension",
+				"espressif.esp-idf-web",
+				"ms-python.python",
+				"ms-python.debugpy",
+				"ms-python.vscode-pylance",
+				"ms-vscode.cmake-tools",
+				"ms-vscode.cpptools",
+				"ms-vscode.makefile-tools",
+				"ms-vscode-remote.remote-containers",
+				"ms-vscode.hexdump",
+				"ms-vscode.cpptools-extension-pack"
+			],
+			"settings": {
+				//"python.defaultInterpreterPath": "/usr/local/bin/python",
+				"python.linting.enabled": true,
+				"python.linting.pylintEnabled": true,
+				"cmake.autoSelectActiveFolder": false,
+				"[c]": {
+					"editor.formatOnSave": true
+				},
+				"[python]": {
+					"editor.formatOnSave": true
+				},
+				"editor.formatOnSave": true,
+				"editor.trimAutoWhitespace": true,
+				"files.trimTrailingWhitespace": true,
+				"C_Cpp.codeAnalysis.clangTidy.enabled": true,
+				"C_Cpp.intelliSenseEngine": "default",
+				"C_Cpp.intelliSenseEngineFallback": "enabled"
+			}
+		}
+	},
+	"postCreateCommand": ".devcontainer/post-create.sh",
+	"postStartCommand": ".devcontainer/post-start.sh",
+	"forwardPorts": [
+		554,
+		8080,
+		3333
+	],
+	"portsAttributes": {
+		"554": {
+			"label": "RTSP Server",
+			"onAutoForward": "notify"
+		},
+		"8080": {
+			"label": "Web Interface",
+			"onAutoForward": "notify"
+		},
+		"3333": {
+			"label": "GDB Debug Server",
+			"onAutoForward": "notify"
+		}
+	}
+}

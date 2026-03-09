@@ -1,0 +1,157 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "idf: set-target",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["set-target", "esp32p4"],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "idf: build",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["build"],
+            "problemMatcher": ["$idf"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "idf: clean",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["clean"],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "idf: fullclean",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["fullclean"],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "idf: flash",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["flash", "-p", "/dev/ttyACM0", "-b", "921600"],
+            "problemMatcher": ["$idf"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "idf: flash (monitor)",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["flash", "-p", "/dev/ttyACM0", "-b", "921600"],
+            "problemMatcher": ["$idf"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "dependsOrder": "sequence",
+            "dependsOn": ["idf: monitor"]
+        },
+        {
+            "label": "idf: monitor",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["monitor", "-p", "/dev/ttyACM0"],
+            "isBackground": true,
+            "problemMatcher": {
+                "pattern": {
+                    "regexp": "^.*$",
+                    "file": 1,
+                    "location": 2,
+                    "message": 3
+                },
+                "background": {
+                    "activeOnStart": true,
+                    "beginsPattern": "^--- idf_monitor ---",
+                    "endsPattern": "^--- idf_monitor ---"
+                }
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "idf: erase_flash",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["erase-flash", "-p", "/dev/ttyACM0"],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "idf: reconfigure",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["reconfigure"],
+            "problemMatcher": ["$idf"],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "idf: menuconfig",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["menuconfig"],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            },
+            "isBackground": true
+        },
+        {
+            "label": "size: app",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["size"],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        },
+        {
+            "label": "size: components",
+            "type": "shell",
+            "command": "idf.py",
+            "args": ["size-components"],
+            "problemMatcher": [],
+            "presentation": {
+                "reveal": "always",
+                "panel": "new"
+            }
+        }
+    ]
+}

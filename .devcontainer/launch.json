@@ -1,0 +1,41 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "GDB: Connect to Device",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/esp_video_uvc.elf",
+            "cwd": "${workspaceFolder}",
+            "stopAtEntry": true,
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "miDebuggerPath": "xtensa-esp32p4-elf-gdb",
+            "setupCommands": [
+                {
+                    "description": "Connect to remote GDB server",
+                    "text": "target remote localhost:3333",
+                    "ignoreFailures": false
+                },
+                {
+                    "description": "Set remote timeout",
+                    "text": "set remote hardware-watchpoint-limit 2",
+                    "ignoreFailures": true
+                }
+            ],
+            "sourceLanguages": ["c", "cpp"]
+        },
+        {
+            "name": "ESP-IDF: Flash and Monitor",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/esp_video_uvc.elf",
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "idf: flash",
+            "stopAtEntry": false,
+            "externalConsole": true,
+            "MIMode": "gdb",
+            "miDebuggerPath": "xtensa-esp32p4-elf-gdb"
+        }
+    ]
+}

@@ -1,0 +1,42 @@
+{
+    "cmake.configureOnOpen": true,
+    "cmake.configureArgs": [
+        "-DIDF_TARGET=esp32p4",
+        "-DCMAKE_BUILD_TYPE=Debug"
+    ],
+    "cmake.sourceDirectory": "${workspaceFolder}",
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "[c]": {
+        "editor.defaultFormatter": "ms-vscode.cpptools",
+        "editor.formatOnSave": true,
+        "editor.formatOnType": false,
+        "editor.codeActionsOnSave": {
+            "source.fixAll": "explicit"
+        }
+    },
+    "C_Cpp.formatting": "clangFormat",
+    "C_Cpp.clang_format_fallbackStyle": "LLVM",
+    "C_Cpp.codeAnalysis.runCodeAnalysis": "openFilesOnly",
+    "C_Cpp.codeAnalysis.clangTidy.enabled": true,
+    "C_Cpp.codeAnalysis.clangTidy.args": [
+        "-checks=-*,readability-*,performance-*"
+    ],
+    "files.exclude": {
+        "**/.git": true,
+        "**/build": false,
+        "**/.pytest_cache": true,
+        "**/__pycache__": true,
+        "**/*.pyc": true,
+        "**/.DS_Store": true
+    },
+    "search.exclude": {
+        "**/build": true,
+        "**/.git": true,
+        "**/node_modules": true
+    },
+    "editor.wordWrap": "on",
+    "editor.rulers": [80, 100, 120],
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4,
+    "editor.detectIndentation": true
+}

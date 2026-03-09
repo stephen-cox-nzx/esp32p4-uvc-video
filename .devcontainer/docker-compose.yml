@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  esp32p4:
+    container_name: esp32p4-uvc-dev
+    build:
+      context: ../
+      dockerfile: .devcontainer/Dockerfile
+    image: esp32p4-uvc:v5.5
+    
+    # Keep container running
+    stdin_open: true
+    tty: true
+    
+    # Mount volumes
+    volumes:
+      - ../:/workspace
+      - idf_tools_cache:/home/vscode/.cache/idf_tools
+      - esp_idf_cache:/root/.cache/idf_tools
+    
+    # Device access for USB (serial/JTAG/debug)
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0
+      - /dev/bus/usb:/dev/bus/usb
+    
+    # Network ports
+    ports:
+      - "554:554"    # RTSP Server
+      - "8080:8080"  # Web Interface
+      - "3333:3333"  # GDB Debug Server
+    
+    # Environment variables
+    environment:
+      - IDF_PATH=/opt/esp-idf
+      - IDF_TOOLS_PATH=/home/vscode/.cache/idf_tools
+      - PYTHONPATH=/opt/esp-idf/tools:/opt/esp-idf/components/partition_table
+      - LC_ALL=C.UTF-8
+      - LANG=C.UTF-8
+    
+    # Working directory
+    working_dir: /workspace
+    
+    # Run post-create hook
+    entrypoint: bash -c "source /opt/esp-idf/export.sh && /bin/bash"
+
+volumes:
+  idf_tools_cache:
+    name: esp32p4_idf_tools_cache
+  esp_idf_cache:
+    name: esp32p4_esp_idf_cache
