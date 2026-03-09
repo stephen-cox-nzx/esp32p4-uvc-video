@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_check.h"
 #include "linux/videodev2.h"
@@ -21,6 +22,17 @@ static const char *TAG = "uvc_ctrl";
 
 /* Cached ISP device fd — opened once at init, used by PU control callbacks */
 static int s_isp_fd = -1;
+
+/* Runtime control state exposed to web UI and kept in sync with USB callbacks */
+static uvc_ctrl_state_t s_state = {
+    .brightness = 0,
+    .contrast = 128,
+    .hue = 0,
+    .saturation = 128,
+    .sharpness = 40,
+    .gain = 8,
+    .profile = CONFIG_ISP_DEFAULT_PROFILE_INDEX,
+};
 
 static esp_err_t set_ext_ctrl(int fd, uint32_t ctrl_class, uint32_t ctrl_id, int32_t value)
 {
@@ -36,7 +48,8 @@ static esp_err_t set_ext_ctrl(int fd, uint32_t ctrl_class, uint32_t ctrl_id, int
     control.id = ctrl_id;
     control.value = value;
 
-    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
+    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) != 0)
+    {
         ESP_LOGW(TAG, "Failed to set control 0x%08lx = %ld",
                  (unsigned long)ctrl_id, (long)value);
         return ESP_FAIL;
@@ -59,7 +72,8 @@ static esp_err_t set_isp_struct_ctrl(int fd, uint32_t ctrl_id, void *data, size_
     control.size = size;
     control.ptr = data;
 
-    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) != 0) {
+    if (ioctl(fd, VIDIOC_S_EXT_CTRLS, &controls) != 0)
+    {
         ESP_LOGW(TAG, "Failed to set ISP control 0x%08lx",
                  (unsigned long)ctrl_id);
         return ESP_FAIL;
@@ -67,14 +81,133 @@ static esp_err_t set_isp_struct_ctrl(int fd, uint32_t ctrl_id, void *data, size_
     return ESP_OK;
 }
 
+static esp_err_t apply_profile(uint8_t profile_idx)
+{
+    if (profile_idx > 5)
+    {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_LOGI(TAG, "Set ISP profile %u", profile_idx);
+    camera_apply_isp_profile((int)profile_idx);
+    s_state.profile = profile_idx;
+    return ESP_OK;
+}
+
+static esp_err_t apply_pu_control(uint8_t cs, int16_t value)
+{
+    if (s_isp_fd < 0)
+    {
+        ESP_LOGW(TAG, "PU control ignored: ISP not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* WB Temperature (0x0A) is repurposed as ISP profile selector (0-5) */
+    if (cs == 0x0A)
+    {
+        return apply_profile((uint8_t)value);
+    }
+
+    uint32_t v4l2_cid;
+    switch (cs)
+    {
+    case 0x02:
+        v4l2_cid = V4L2_CID_BRIGHTNESS;
+        break;
+    case 0x03:
+        v4l2_cid = V4L2_CID_CONTRAST;
+        break;
+    case 0x04:
+    {
+        esp_video_isp_sharpen_t sharpen = {
+            .enable = (value > 0),
+            .h_thresh = (uint8_t)value,
+            .l_thresh = (uint8_t)(value / 4),
+            .h_coeff = 1.5f,
+            .m_coeff = 0.5f,
+            .matrix = {
+                {1, 2, 1},
+                {2, 4, 2},
+                {1, 2, 1},
+            },
+        };
+        esp_err_t ret = set_isp_struct_ctrl(s_isp_fd, V4L2_CID_USER_ESP_ISP_SHARPEN,
+                                            &sharpen, sizeof(sharpen));
+        if (ret == ESP_OK)
+        {
+            s_state.sharpness = value;
+            ESP_LOGI(TAG, "PU Sharpness -> ISP h_thresh=%d", (int)value);
+        }
+        return ret;
+    }
+    case 0x06:
+        v4l2_cid = V4L2_CID_HUE;
+        break;
+    case 0x07:
+        v4l2_cid = V4L2_CID_SATURATION;
+        break;
+    case 0x10:
+    {
+        esp_video_isp_bf_t bf = {
+            .enable = (value >= 2),
+            .level = (value < 2) ? 2 : (uint8_t)value,
+            .matrix = {
+                {1, 2, 1},
+                {2, 4, 2},
+                {1, 2, 1},
+            },
+        };
+        esp_err_t ret = set_isp_struct_ctrl(s_isp_fd, V4L2_CID_USER_ESP_ISP_BF,
+                                            &bf, sizeof(bf));
+        if (ret == ESP_OK)
+        {
+            s_state.gain = value;
+            ESP_LOGI(TAG, "PU Gain -> BF denoise level=%d %s",
+                     (int)value, bf.enable ? "ON" : "OFF");
+        }
+        return ret;
+    }
+    default:
+        ESP_LOGW(TAG, "Unknown PU cs=0x%02x", cs);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    esp_err_t ret = set_ext_ctrl(s_isp_fd, V4L2_CID_USER_CLASS, v4l2_cid, (int32_t)value);
+    if (ret == ESP_OK)
+    {
+        switch (cs)
+        {
+        case 0x02:
+            s_state.brightness = value;
+            break;
+        case 0x03:
+            s_state.contrast = value;
+            break;
+        case 0x06:
+            s_state.hue = value;
+            break;
+        case 0x07:
+            s_state.saturation = value;
+            break;
+        default:
+            break;
+        }
+        ESP_LOGI(TAG, "PU cs=0x%02x -> V4L2 0x%08lx = %d",
+                 cs, (unsigned long)v4l2_cid, (int)value);
+    }
+    return ret;
+}
+
 esp_err_t uvc_ctrl_init(void)
 {
-    if (s_isp_fd >= 0) {
-        return ESP_OK;  /* Already initialized */
+    if (s_isp_fd >= 0)
+    {
+        return ESP_OK; /* Already initialized */
     }
 
     s_isp_fd = open(ESP_VIDEO_ISP1_DEVICE_NAME, O_RDWR);
-    if (s_isp_fd < 0) {
+    if (s_isp_fd < 0)
+    {
         ESP_LOGW(TAG, "Cannot open ISP device %s for PU controls",
                  ESP_VIDEO_ISP1_DEVICE_NAME);
         return ESP_FAIL;
@@ -89,7 +222,8 @@ esp_err_t uvc_ctrl_init(void)
 
 void uvc_ctrl_deinit(void)
 {
-    if (s_isp_fd >= 0) {
+    if (s_isp_fd >= 0)
+    {
         close(s_isp_fd);
         s_isp_fd = -1;
         ESP_LOGI(TAG, "PU control bridge deinitialized");
@@ -97,7 +231,7 @@ void uvc_ctrl_deinit(void)
 }
 
 esp_err_t uvc_ctrl_set_h264_params(int m2m_fd, int bitrate, int i_period,
-                                    int min_qp, int max_qp)
+                                   int min_qp, int max_qp)
 {
     ESP_LOGI(TAG, "H.264: bitrate=%d, I-period=%d, QP=%d-%d",
              bitrate, i_period, min_qp, max_qp);
@@ -139,72 +273,7 @@ esp_err_t uvc_ctrl_set_jpeg_quality(int m2m_fd, int quality)
  */
 void uvc_pu_control_set_cb(uint8_t cs, int16_t value)
 {
-    if (s_isp_fd < 0) {
-        ESP_LOGW(TAG, "PU control ignored: ISP not initialized");
-        return;
-    }
-
-    /* WB Temperature (0x0A) is repurposed as ISP profile selector (0-5) */
-    if (cs == 0x0A) {
-        ESP_LOGI(TAG, "PU WB Temp -> ISP profile %d", (int)value);
-        camera_apply_isp_profile((int)value);
-        return;
-    }
-
-    uint32_t v4l2_cid;
-    switch (cs) {
-    case 0x02: v4l2_cid = V4L2_CID_BRIGHTNESS; break;
-    case 0x03: v4l2_cid = V4L2_CID_CONTRAST;   break;
-    case 0x04: {  /* Sharpness -> ISP sharpen h_thresh */
-        esp_video_isp_sharpen_t sharpen = {
-            .enable = (value > 0),
-            .h_thresh = (uint8_t)value,
-            .l_thresh = (uint8_t)(value / 4),
-            .h_coeff = 1.5f,
-            .m_coeff = 0.5f,
-            .matrix = {
-                { 1, 2, 1 },
-                { 2, 4, 2 },
-                { 1, 2, 1 },
-            },
-        };
-        esp_err_t ret = set_isp_struct_ctrl(s_isp_fd, V4L2_CID_USER_ESP_ISP_SHARPEN,
-                                             &sharpen, sizeof(sharpen));
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "PU Sharpness -> ISP h_thresh=%d", (int)value);
-        }
-        return;
-    }
-    case 0x06: v4l2_cid = V4L2_CID_HUE;        break;
-    case 0x07: v4l2_cid = V4L2_CID_SATURATION;  break;
-    case 0x10: {  /* Gain -> BF denoising level */
-        esp_video_isp_bf_t bf = {
-            .enable = (value >= 2),
-            .level = (value < 2) ? 2 : (uint8_t)value,
-            .matrix = {
-                { 1, 2, 1 },
-                { 2, 4, 2 },
-                { 1, 2, 1 },
-            },
-        };
-        esp_err_t ret = set_isp_struct_ctrl(s_isp_fd, V4L2_CID_USER_ESP_ISP_BF,
-                                             &bf, sizeof(bf));
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "PU Gain -> BF denoise level=%d %s",
-                     (int)value, bf.enable ? "ON" : "OFF");
-        }
-        return;
-    }
-    default:
-        ESP_LOGW(TAG, "Unknown PU cs=0x%02x", cs);
-        return;
-    }
-
-    esp_err_t ret = set_ext_ctrl(s_isp_fd, V4L2_CID_USER_CLASS, v4l2_cid, (int32_t)value);
-    if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "PU cs=0x%02x -> V4L2 0x%08lx = %d",
-                 cs, (unsigned long)v4l2_cid, (int)value);
-    }
+    (void)apply_pu_control(cs, value);
 }
 
 /*
@@ -219,10 +288,51 @@ void uvc_pu_control_set_cb(uint8_t cs, int16_t value)
  */
 void uvc_xu_control_set_cb(uint8_t cs, uint8_t value)
 {
-    if (cs == 0x01) {
-        ESP_LOGI(TAG, "XU ISP Profile: %u", value);
-        camera_apply_isp_profile((int)value);
-    } else {
+    if (cs == 0x01)
+    {
+        (void)apply_profile(value);
+    }
+    else
+    {
         ESP_LOGW(TAG, "Unknown XU cs=0x%02x", cs);
     }
+}
+
+esp_err_t uvc_ctrl_set_pu(uint8_t cs, int16_t value)
+{
+    return apply_pu_control(cs, value);
+}
+
+esp_err_t uvc_ctrl_set_profile(uint8_t profile_idx)
+{
+    return apply_profile(profile_idx);
+}
+
+void uvc_ctrl_get_state(uvc_ctrl_state_t *out_state)
+{
+    if (!out_state)
+    {
+        return;
+    }
+    *out_state = s_state;
+}
+
+esp_err_t uvc_ctrl_reset_defaults(void)
+{
+    esp_err_t ret = ESP_OK;
+    if (uvc_ctrl_set_pu(0x02, 0) != ESP_OK)
+        ret = ESP_FAIL;
+    if (uvc_ctrl_set_pu(0x03, 128) != ESP_OK)
+        ret = ESP_FAIL;
+    if (uvc_ctrl_set_pu(0x06, 0) != ESP_OK)
+        ret = ESP_FAIL;
+    if (uvc_ctrl_set_pu(0x07, 128) != ESP_OK)
+        ret = ESP_FAIL;
+    if (uvc_ctrl_set_pu(0x04, 40) != ESP_OK)
+        ret = ESP_FAIL;
+    if (uvc_ctrl_set_pu(0x10, 8) != ESP_OK)
+        ret = ESP_FAIL;
+    if (uvc_ctrl_set_profile(CONFIG_ISP_DEFAULT_PROFILE_INDEX) != ESP_OK)
+        ret = ESP_FAIL;
+    return ret;
 }

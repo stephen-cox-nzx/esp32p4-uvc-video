@@ -86,4 +86,5 @@ void app_main(void)
     ESP_LOGI(TAG, "RTSP stream: rtsp://<device-ip>:554/stream");
     ESP_LOGI(TAG, "ONVIF device: http://<device-ip>:%d/onvif/device_service",
              CONFIG_ONVIF_HTTP_PORT);
+    ESP_LOGI(TAG, "Control UI:   http://<device-ip>:%d/", CONFIG_ONVIF_HTTP_PORT);
 }

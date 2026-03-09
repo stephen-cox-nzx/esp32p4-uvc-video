@@ -34,6 +34,7 @@
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "expat.h"
+#include "uvc_controls.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lwip/sockets.h"
@@ -235,6 +236,212 @@ static bool extract_soap_method(const char *xml_body, int xml_len,
   }
   snprintf(method_out, method_out_size, "%s", ctx.method);
   return true;
+}
+
+/* ---- Web UI (UVC controls) --------------------------------------------- */
+
+static const char WEB_UI_HTML[] =
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>ESP32-P4 Camera Controls</title>"
+    "<style>"
+    ":root{--bg:#f2efe7;--ink:#18242b;--card:#fffdf7;--line:#d8d0c2;--acc:#bf4d28;}"
+    "*{box-sizing:border-box}body{margin:0;font-family:'Trebuchet MS',Verdana,sans-serif;"
+    "background:radial-gradient(circle at 20% 10%,#fff8ea,transparent 35%),var(--bg);color:var(--ink)}"
+    "main{max-width:780px;margin:20px auto;padding:14px}"
+    "h1{margin:0 0 8px 0;font-size:1.6rem;letter-spacing:.02em}"
+    ".card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin:10px 0;"
+    "box-shadow:0 8px 20px rgba(0,0,0,.05)}"
+    ".row{display:grid;grid-template-columns:120px 1fr 56px;gap:10px;align-items:center;margin:9px 0}"
+    "input[type=range]{width:100%;accent-color:var(--acc)}"
+    ".profiles label{display:block;padding:5px 0}"
+    "button{border:0;background:var(--acc);color:#fff;padding:10px 12px;border-radius:9px;cursor:pointer}"
+    "button:active{transform:translateY(1px)}"
+    "#status{margin-top:8px;font-size:.95rem;color:#3a4f5f;min-height:1.3em}"
+    "@media (max-width:640px){.row{grid-template-columns:1fr}.val{text-align:left}}"
+    "</style></head><body><main>"
+    "<h1>ESP32-P4 UVC Control Panel</h1>"
+    "<div class='card' id='pu'></div>"
+    "<div class='card'><h3 style='margin-top:0'>ISP Color Profile</h3><div class='profiles' id='profiles'></div></div>"
+    "<div class='card'><button id='reset'>Reset All to Defaults</button><div id='status'></div></div>"
+    "</main><script>"
+    "const controls=["
+    "{key:'brightness',label:'Brightness',min:-127,max:127},"
+    "{key:'contrast',label:'Contrast',min:0,max:256},"
+    "{key:'hue',label:'Hue',min:0,max:255},"
+    "{key:'saturation',label:'Saturation',min:0,max:256},"
+    "{key:'sharpness',label:'Sharpness',min:0,max:100},"
+    "{key:'gain',label:'Denoise (BF)',min:0,max:20}];"
+    "const profiles=['Tungsten (2873K)','Indoor-Warm (3725K)','Fluorescent (5095K)','Daylight (6015K)','Cloudy (6865K)','Shade (7600K)'];"
+    "const pu=document.getElementById('pu'),pf=document.getElementById('profiles'),statusEl=document.getElementById('status');"
+    "function status(s){statusEl.textContent=s;}"
+    "function row(c,v){const d=document.createElement('div');d.className='row';"
+    "const l=document.createElement('label');l.textContent=c.label;"
+    "const i=document.createElement('input');i.type='range';i.min=c.min;i.max=c.max;i.value=v;"
+    "const n=document.createElement('div');n.className='val';n.textContent=v;"
+    "i.oninput=()=>{n.textContent=i.value};"
+    "i.onchange=()=>setCtrl(c.key,parseInt(i.value,10));"
+    "d.append(l,i,n);return d;}"
+    "async function setCtrl(name,value){"
+    "const r=await fetch('/api/set?name='+encodeURIComponent(name)+'&value='+encodeURIComponent(value),{method:'POST'});"
+    "status(r.ok?('Set '+name+' = '+value):('Failed '+name));}"
+    "async function load(){"
+    "const r=await fetch('/api/state');if(!r.ok){status('Cannot load state');return;}"
+    "const s=await r.json();pu.innerHTML='';controls.forEach(c=>pu.appendChild(row(c,s[c.key])));"
+    "pf.innerHTML='';profiles.forEach((name,i)=>{const l=document.createElement('label');"
+    "const rb=document.createElement('input');rb.type='radio';rb.name='profile';rb.checked=s.profile===i;"
+    "rb.onchange=()=>setCtrl('profile',i);l.append(rb,document.createTextNode(' '+name));pf.appendChild(l);});"
+    "status('Ready');}"
+    "document.getElementById('reset').onclick=async()=>{const r=await fetch('/api/reset',{method:'POST'});status(r.ok?'Defaults restored':'Reset failed');if(r.ok)load();};"
+    "load();"
+    "</script></body></html>";
+
+static esp_err_t send_json_state(httpd_req_t *req)
+{
+  uvc_ctrl_state_t s;
+  uvc_ctrl_get_state(&s);
+
+  char body[256];
+  int n = snprintf(body, sizeof(body),
+                   "{\"brightness\":%d,\"contrast\":%d,\"hue\":%d,"
+                   "\"saturation\":%d,\"sharpness\":%d,\"gain\":%d,\"profile\":%u}",
+                   s.brightness, s.contrast, s.hue,
+                   s.saturation, s.sharpness, s.gain, (unsigned)s.profile);
+  if (n <= 0 || n >= (int)sizeof(body))
+  {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "State encode failed");
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, body, n);
+}
+
+static bool get_int_arg(httpd_req_t *req, const char *key, int *out)
+{
+  char query[128];
+  size_t qlen = httpd_req_get_url_query_len(req);
+  if (qlen == 0 || qlen >= sizeof(query))
+  {
+    return false;
+  }
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK)
+  {
+    return false;
+  }
+
+  char val[24];
+  if (httpd_query_key_value(query, key, val, sizeof(val)) != ESP_OK)
+  {
+    return false;
+  }
+
+  char *end = NULL;
+  long parsed = strtol(val, &end, 10);
+  if (!end || *end != '\0')
+  {
+    return false;
+  }
+  *out = (int)parsed;
+  return true;
+}
+
+static bool get_name_arg(httpd_req_t *req, char *name, size_t name_size)
+{
+  char query[128];
+  size_t qlen = httpd_req_get_url_query_len(req);
+  if (qlen == 0 || qlen >= sizeof(query))
+  {
+    return false;
+  }
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK)
+  {
+    return false;
+  }
+  return httpd_query_key_value(query, "name", name, name_size) == ESP_OK;
+}
+
+static esp_err_t web_index_handler(httpd_req_t *req)
+{
+  httpd_resp_set_type(req, "text/html; charset=utf-8");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+  return httpd_resp_send(req, WEB_UI_HTML, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t web_state_handler(httpd_req_t *req)
+{
+  return send_json_state(req);
+}
+
+static bool value_in_range(const char *name, int value)
+{
+  if (strcmp(name, "brightness") == 0)
+    return value >= -127 && value <= 127;
+  if (strcmp(name, "contrast") == 0)
+    return value >= 0 && value <= 256;
+  if (strcmp(name, "hue") == 0)
+    return value >= 0 && value <= 255;
+  if (strcmp(name, "saturation") == 0)
+    return value >= 0 && value <= 256;
+  if (strcmp(name, "sharpness") == 0)
+    return value >= 0 && value <= 100;
+  if (strcmp(name, "gain") == 0)
+    return value >= 0 && value <= 20;
+  if (strcmp(name, "profile") == 0)
+    return value >= 0 && value <= 5;
+  return false;
+}
+
+static esp_err_t web_set_handler(httpd_req_t *req)
+{
+  char name[24];
+  int value = 0;
+  if (!get_name_arg(req, name, sizeof(name)) || !get_int_arg(req, "value", &value))
+  {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Need query args: name,value");
+    return ESP_ERR_INVALID_ARG;
+  }
+  if (!value_in_range(name, value))
+  {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid value");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  esp_err_t err = ESP_ERR_NOT_SUPPORTED;
+  if (strcmp(name, "brightness") == 0)
+    err = uvc_ctrl_set_pu(0x02, (int16_t)value);
+  else if (strcmp(name, "contrast") == 0)
+    err = uvc_ctrl_set_pu(0x03, (int16_t)value);
+  else if (strcmp(name, "hue") == 0)
+    err = uvc_ctrl_set_pu(0x06, (int16_t)value);
+  else if (strcmp(name, "saturation") == 0)
+    err = uvc_ctrl_set_pu(0x07, (int16_t)value);
+  else if (strcmp(name, "sharpness") == 0)
+    err = uvc_ctrl_set_pu(0x04, (int16_t)value);
+  else if (strcmp(name, "gain") == 0)
+    err = uvc_ctrl_set_pu(0x10, (int16_t)value);
+  else if (strcmp(name, "profile") == 0)
+    err = uvc_ctrl_set_profile((uint8_t)value);
+
+  if (err != ESP_OK)
+  {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Apply failed");
+    return err;
+  }
+
+  return send_json_state(req);
+}
+
+static esp_err_t web_reset_handler(httpd_req_t *req)
+{
+  esp_err_t err = uvc_ctrl_reset_defaults();
+  if (err != ESP_OK)
+  {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Reset failed");
+    return err;
+  }
+  return send_json_state(req);
 }
 
 /* ---- HTTP / SOAP helpers ------------------------------------------------ */
@@ -1048,8 +1255,36 @@ esp_err_t onvif_server_start(void)
   };
   httpd_register_uri_handler(http_server, &media_uri);
 
-  ESP_LOGI(TAG, "ONVIF HTTP server started (port %d, esp_http_server + expat)",
-           ONVIF_HTTP_PORT);
+  static const httpd_uri_t web_index = {
+      .uri = "/",
+      .method = HTTP_GET,
+      .handler = web_index_handler,
+  };
+  httpd_register_uri_handler(http_server, &web_index);
+
+  static const httpd_uri_t web_state = {
+      .uri = "/api/state",
+      .method = HTTP_GET,
+      .handler = web_state_handler,
+  };
+  httpd_register_uri_handler(http_server, &web_state);
+
+  static const httpd_uri_t web_set = {
+      .uri = "/api/set",
+      .method = HTTP_POST,
+      .handler = web_set_handler,
+  };
+  httpd_register_uri_handler(http_server, &web_set);
+
+  static const httpd_uri_t web_reset = {
+      .uri = "/api/reset",
+      .method = HTTP_POST,
+      .handler = web_reset_handler,
+  };
+  httpd_register_uri_handler(http_server, &web_reset);
+
+  ESP_LOGI(TAG, "ONVIF+Web HTTP server started (port %d)", ONVIF_HTTP_PORT);
+  ESP_LOGI(TAG, "Web UI: http://<device-ip>:%d/", ONVIF_HTTP_PORT);
 
   return ESP_OK;
 }
